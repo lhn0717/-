@@ -1,115 +1,176 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from io import BytesIO
 
-# --- 1. 数据库设置 ---
-DB_FILE = 'water_system_v6.db'
+# --- 1. 核心计费函数 ---
+def calculate_stepped_fee_detailed(usage, N, p1, p2, p3):
+    if N <= 0 or usage <= 0: return 0.0, "未使用"
+    t1_limit = 18 / N
+    t2_limit = 40 / N
+    fee, steps = 0.0, []
+    
+    u1 = min(usage, t1_limit)
+    fee += u1 * p1
+    steps.append(f"一档:{u1:.2f}t×{p1}")
+    
+    if usage > t1_limit:
+        u2 = min(usage, t2_limit) - t1_limit
+        fee += u2 * p2
+        steps.append(f"二档:{u2:.2f}t×{p2}")
+    
+    if usage > t2_limit:
+        u3 = usage - t2_limit
+        fee += u3 * p3
+        steps.append(f"三档:{u3:.2f}t×{p3}")
+        
+    return round(fee, 2), " + ".join(steps)
 
+# --- 2. 数据库初始化 ---
+DB_FILE = 'water_manager_v17.db' # 升级版本号以匹配新单价逻辑
 def init_db():
     conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS records (
-                    month TEXT, user_id TEXT, 
-                    user_usage REAL, water_fee REAL, 
-                    note1 REAL, note2 REAL, total REAL,
-                    PRIMARY KEY (month, user_id))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS records (
+                    month TEXT, user_id TEXT, u_diff REAL, 
+                    avg_error REAL, billing_q REAL, 
+                    water_fee REAL, water_steps TEXT,
+                    extra_total REAL, extra_desc TEXT, 
+                    total REAL, PRIMARY KEY (month, user_id))''')
     conn.commit()
     conn.close()
+
+# 中英文字段对照表
+COLUMN_MAP = {
+    "month": "月份", "user_id": "房客/房间名", "u_diff": "实际读数用量",
+    "avg_error": "分摊误差", "billing_q": "计费总量", "water_fee": "水费金额",
+    "water_steps": "水费计算详情", "extra_total": "备注费用总计",
+    "extra_desc": "备注明细", "total": "总合计"
+}
 
 init_db()
 
-# --- 2. 核心计费逻辑 ---
-def calculate_stepped_fee(usage, N, p1, p2, p3):
-    if N <= 0 or usage <= 0: return 0.0
-    t1_limit = 18 / N
-    t2_limit = 40 / N
-    if usage <= t1_limit:
-        return round(usage * p1, 2)
-    elif usage <= t2_limit:
-        return round((t1_limit * p1) + (usage - t1_limit) * p2, 2)
-    else:
-        return round((t1_limit * p1) + ((t2_limit - t1_limit) * p2) + (usage - t2_limit) * p3, 2)
+# --- 3. 状态管理 ---
+if 'row_counts' not in st.session_state:
+    st.session_state.row_counts = {i: 0 for i in range(1, 11)}
+if 'expander_states' not in st.session_state:
+    st.session_state.expander_states = {i: False for i in range(1, 11)}
+if 'user_names' not in st.session_state:
+    st.session_state.user_names = {i: f"房客 {i:02d}" for i in range(1, 11)}
 
-# --- 3. 界面 ---
-st.set_page_config(page_title="水费收缴助手", layout="centered")
-st.title("💧 水费收缴助手 (手机版)")
+# --- 4. 界面展示 ---
+st.set_page_config(page_title="水电管家-调价版", layout="wide")
+st.title("💧 水费核算系统 ")
 
-# 计费规则设置 (侧边栏)
-st.sidebar.header("⚙️ 单价自定义")
-p1 = st.sidebar.number_input("一档单价", value=2.2)
-p2 = st.sidebar.number_input("二档单价", value=3.3)
-p3 = st.sidebar.number_input("三档单价", value=6.6)
+# 侧边栏：已更新默认单价
+st.sidebar.header("⚙️ 计费单价设置")
+p1 = st.sidebar.number_input("第一档单价", value=3.2)
+p2 = st.sidebar.number_input("第二档单价", value=5.3)
+p3 = st.sidebar.number_input("第三档单价", value=7.6)
 
-# 显示规则
-with st.expander("📖 计费规则说明"):
-    st.write(f"当前模式：按人数 N 分摊 18/40 吨额度")
-    st.write(f"价格：{p1}元 / {p2}元 / {p3}元")
-
-# --- 总表区 ---
-st.subheader("📊 表1：总表读数")
+# 第一步：总表信息
 with st.container(border=True):
-    c1, c2, c3 = st.columns([1.2, 1, 1])
-    with c1:
-        month_str = st.selectbox("月份", [f"2026-{i:02d}" for i in range(1, 13)])
-    with c2:
-        main_s = st.number_input("总表期初", min_value=0.0)
-    with c3:
-        main_e = st.number_input("总表期末", min_value=0.0)
-    total_main = max(0.0, main_e - main_s)
-    st.info(f"本月总消耗：{total_main:.1f} 吨")
+    st.subheader("📊 第一步：总表读数")
+    c1, c2, c3 = st.columns(3)
+    with c1: month_str = st.selectbox("选择月份", [f"2026-{i:02d}" for i in range(1, 13)])
+    with c2: m_s = st.number_input("总表期初", value=0.0, step=0.1)
+    with c3: m_e = st.number_input("总表期末", value=0.0, step=0.1)
+    main_total = max(0.0, m_e - m_s)
+    st.info(f"💡 总表实际消耗：**{main_total:.2f}** 吨")
 
-# --- 房客录入区 ---
-st.subheader("👤 表2：房客用量")
+st.divider()
+
+# 第二步：房客录入
+st.subheader("👤 第二步：房客数据")
 user_inputs = []
-# 手机端建议使用列表形式，更易点击
 for i in range(1, 11):
-    with st.expander(f"房客 {i:02d} 的数据"):
-        col_u, col_n1, col_n2 = st.columns(3)
-        with col_u:
-            u_usage = st.number_input("用水量", key=f"u{i}", min_value=0.0)
-        with col_n1:
-            n1 = st.number_input("房租", key=f"n1{i}", value=0.0)
-        with col_n2:
-            n2 = st.number_input("备注", key=f"n2{i}", value=0.0)
-        user_inputs.append({"id": f"房客 {i:02d}", "usage": u_usage, "n1": n1, "n2": n2})
-
-# --- 计算与保存 ---
-active_users = [u for u in user_inputs if u['usage'] > 0]
-N = len(active_users)
-sum_reported = sum(u['usage'] for u in user_inputs)
-avg_err = (total_main - sum_reported) / N if N > 0 else 0.0
-
-if st.button("🚀 生成并存为本月记录", type="primary", use_container_width=True):
-    conn = sqlite3.connect(DB_FILE)
-    results = []
-    for u in user_inputs:
-        err = avg_err if u['usage'] > 0 else 0.0
-        final_q = u['usage'] + err
-        fee = calculate_stepped_fee(final_q, N, p1, p2, p3)
-        total_p = round(fee + u['n1'] + u['n2'], 2)
+    current_name = st.session_state.user_names[i]
+    with st.expander(f"🏠 {current_name}", expanded=st.session_state.expander_states[i]):
+        # 修改名字
+        new_name = st.text_input("编辑名称", value=current_name, key=f"name_in_{i}")
+        st.session_state.user_names[i] = new_name
         
-        conn.execute("INSERT OR REPLACE INTO records VALUES (?,?,?,?,?,?,?)",
-                     (month_str, u['id'], u['usage'], fee, u['n1'], u['n2'], total_p))
-        results.append({"房客": u['id'], "用量": u['usage'], "合计": total_p})
+        col_s, col_e = st.columns(2)
+        u_s = col_s.number_input("月初读数", key=f"s_{i}", value=0.0)
+        u_e = col_e.number_input("月末读数", key=f"e_{i}", value=0.0)
+        u_diff = max(0.0, u_e - u_s)
+        
+        st.write("📋 备注费用项目：")
+        extras = []
+        for r in range(st.session_state.row_counts[i]):
+            r_c1, r_c2 = st.columns([1, 2])
+            ev = r_c1.number_input("金额", key=f"v_{i}_{r}", min_value=0.0)
+            et = r_c2.text_input("项目说明", key=f"t_{i}_{r}")
+            extras.append({"val": ev, "txt": et})
+        
+        b1, b2, _ = st.columns([1.5, 1, 2])
+        if b1.button("➕ 增加备注项", key=f"add_{i}"):
+            st.session_state.row_counts[i] += 1
+            st.session_state.expander_states[i] = True
+            st.rerun()
+        if st.session_state.row_counts[i] > 0:
+            if b2.button("🗑️ 清空备注", key=f"clr_{i}"):
+                st.session_state.row_counts[i] = 0
+                st.session_state.expander_states[i] = True
+                st.rerun()
+        
+        user_inputs.append({"id": new_name, "diff": u_diff, "extras": extras})
+
+# 第三步：核算与展示
+st.divider()
+if st.button("🚀 生成详细账单并保存", type="primary", use_container_width=True):
+    for k in st.session_state.expander_states: st.session_state.expander_states[k] = False
+    
+    active_users = [u for u in user_inputs if u['diff'] > 0]
+    N = len(active_users)
+    sum_reported = sum(u['diff'] for u in user_inputs)
+    total_error = main_total - sum_reported
+    avg_error_val = total_error / N if N > 0 else 0.0
+    
+    final_data = []
+    conn = sqlite3.connect(DB_FILE)
+    for u in user_inputs:
+        p_err = avg_error_val if u['diff'] > 0 else 0.0
+        billing_q = u['diff'] + p_err
+        w_fee, w_steps = calculate_stepped_fee_detailed(billing_q, N, p1, p2, p3)
+        e_sum = sum(item['val'] for item in u['extras'])
+        e_desc = " | ".join([f"{item['txt']}({item['val']})" for item in u['extras'] if item['val']>0])
+        grand_total = round(w_fee + e_sum, 2)
+        
+        conn.execute("INSERT OR REPLACE INTO records VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     (month_str, u['id'], u['diff'], p_err, billing_q, w_fee, w_steps, e_sum, e_desc, grand_total))
+        
+        final_data.append({
+            "房客/房间名": u['id'], "实际用量": f"{u['diff']:.1f}t",
+            "分摊误差": f"{p_err:.2f}t", "计费总量": f"{billing_q:.2f}t",
+            "水费详情": w_steps, "水费金额": w_fee,
+            "备注总额": e_sum, "备注明细": e_desc if e_desc else "无",
+            "总合计": grand_total
+        })
     conn.commit()
     conn.close()
-    st.success("数据已存入手机本地缓存")
-    st.table(pd.DataFrame(results))
-
-# --- 查看历史 ---
-st.divider()
-st.subheader("📜 历史数据查看")
-conn = sqlite3.connect(DB_FILE)
-history_df = pd.read_sql(f"SELECT * FROM records ORDER BY month DESC", conn)
-conn.close()
-
-if not history_df.empty:
-    target_m = st.selectbox("筛选历史月份", history_df['month'].unique())
-    st.dataframe(history_df[history_df['month'] == target_m], use_container_width=True)
     
-    # 导出按钮 (防止云端丢失数据)
-    csv = history_df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 导出全量历史数据(CSV)", data=csv, file_name="water_backup.csv", mime="text/csv")
-else:
-    st.write("暂无历史记录")
+    df_res = pd.DataFrame(final_data)
+    st.table(df_res)
+    
+    csv_data = df_res.to_csv(index=False).encode('utf-8-sig')
+    st.download_button("📥 下载本月中文账单 (.csv)", data=csv_data, 
+                       file_name=f"{month_str}水费账单_新单价.csv", use_container_width=True)
+
+# 历史记录
+st.divider()
+if st.checkbox("📜 查看/导出历史全量报表"):
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        h_df = pd.read_sql("SELECT * FROM records ORDER BY month DESC", conn)
+        conn.close()
+        if not h_df.empty:
+            h_df_cn = h_df.rename(columns=COLUMN_MAP)
+            sel_m = st.selectbox("选择月份查询", h_df_cn['月份'].unique())
+            st.dataframe(h_df_cn[h_df_cn['月份'] == sel_m], use_container_width=True)
+            full_csv = h_df_cn.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("📥 导出全量历史数据", data=full_csv, file_name="水电费历史记录.csv")
+    except:
+        st.warning("如遇到数据读取错误，可尝试修复数据库。")
+        if st.button("修复数据库"):
+            import os
+            if os.path.exists(DB_FILE): os.remove(DB_FILE)
+            st.rerun()
